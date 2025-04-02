@@ -1,0 +1,53 @@
+---
+- name: Configure dynamic HAProxy load balancing
+  hosts: load_balancers
+  become: true
+  vars:
+    haproxy_config: "/etc/haproxy/haproxy.cfg"
+    aws_region: "us-east-1"
+    health_check_path: "/health"
+    backend_name: "aws_burst_nodes"
+
+  tasks:
+    - name: Install HAProxy
+      apt:
+        name: haproxy
+        state: latest
+        update_cache: yes
+
+    - name: Gather running AWS burst instances
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:AutoScalingGroup": "cloud-burst-asg"
+          "instance-state-name": "running"
+      register: aws_instances
+      delegate_to: localhost
+
+    - name: Generate backend configuration
+      template:
+        src: "templates/haproxy_backend.j2"
+        dest: "/tmp/haproxy_backend.cfg"
+      vars:
+        instances: "{{ aws_instances.instances }}"
+
+    - name: Update HAProxy configuration
+      blockinfile:
+        path: "{{ haproxy_config }}"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - AWS BACKENDS"
+        block: "{{ lookup('file', '/tmp/haproxy_backend.cfg') }}"
+        backup: yes
+      notify:
+        - Reload HAProxy
+
+    - name: Validate configuration
+      command: haproxy -c -f "{{ haproxy_config }}"
+      register: haproxy_validate
+      changed_when: false
+      failed_when: "haproxy_validate.rc != 0"
+
+  handlers:
+    - name: Reload HAProxy
+      service:
+        name: haproxy
+        state: reloaded
