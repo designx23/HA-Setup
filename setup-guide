@@ -1,0 +1,358 @@
+Hybrid Cloud Bursting Setup Guide
+Phase 1: Pre-Deployment Preparation
+1.1 Infrastructure Requirements
+markdown
+Copy
+Purpose: Verify your environment meets minimum specs  
+Action:
+1. On-Premise Servers:
+   - 2+ physical/virtual machines (4vCPU/8GB RAM each)
+   - Ubuntu 22.04 LTS installed
+   - Private network for database replication (recommended VLAN)
+
+2. AWS Account:
+   - IAM user with EC2, VPC, and Auto Scaling permissions
+   - Configured billing alerts
+   - Default VPC removed (best practice)
+
+Verification:
+```bash
+# On each on-prem server:
+lscpu | grep "CPU(s)"
+free -h | grep "Mem"
+1.2 Tool Installation
+markdown
+Copy
+Purpose: Install required tools on your workstation  
+Steps:
+
+1. Install Terraform:
+```bash
+curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
+sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+sudo apt update && sudo apt install terraform
+Install Ansible:
+
+bash
+Copy
+sudo apt install ansible-core python3-pip
+pip install boto3 botocore
+Configure AWS CLI:
+
+bash
+Copy
+aws configure
+> Enter your IAM access keys
+> Set default region (e.g., us-east-1)
+Verification:
+
+bash
+Copy
+terraform -version
+ansible --version
+aws sts get-caller-identity
+Phase 2: On-Premise Setup
+2.1 Load Balancer Configuration
+markdown
+Copy
+**Purpose**: Set up HAProxy with Keepalived for high availability  
+
+1. Install packages:
+```bash
+sudo apt update && sudo apt install -y haproxy keepalived
+Configure HAProxy (edit /etc/haproxy/haproxy.cfg):
+
+plaintext
+Copy
+frontend http-in
+    bind *:80
+    bind *:443 ssl crt /etc/ssl/private/example.com.pem
+    default_backend servers
+
+backend servers
+    balance roundrobin
+    server onprem1 192.168.1.100:80 check
+    server onprem2 192.168.1.101:80 check
+    # AWS instances will be added dynamically later
+Set up Keepalived (edit /etc/keepalived/keepalived.conf):
+
+plaintext
+Copy
+vrrp_script chk_haproxy {
+    script "killall -0 haproxy"
+    interval 2
+}
+
+vrrp_instance VI_1 {
+    interface eth0
+    state MASTER    # BACKUP on secondary node
+    virtual_router_id 51
+    priority 100    # Lower on backup (e.g., 90)
+    virtual_ipaddress {
+        192.168.1.200/24
+    }
+    track_script {
+        chk_haproxy
+    }
+}
+Verification:
+
+bash
+Copy
+sudo systemctl restart haproxy keepalived
+curl http://192.168.1.200  # Should return your service
+2.2 Database Cluster Setup
+markdown
+Copy
+Purpose: Configure MySQL Galera Cluster for synchronous replication  
+
+1. Install packages on all nodes:
+```bash
+sudo apt install -y mysql-server galera-4
+Configure Galera (edit /etc/mysql/conf.d/galera.cnf):
+
+plaintext
+Copy
+[mysqld]
+binlog_format=ROW
+default-storage-engine=innodb
+innodb_autoinc_lock_mode=2
+bind-address=0.0.0.0
+
+[galera]
+wsrep_on=ON
+wsrep_provider=/usr/lib/galera/libgalera_smm.so
+wsrep_cluster_name="my_cluster"
+wsrep_cluster_address="gcomm://192.168.1.100,192.168.1.101"
+wsrep_sst_method=rsync
+Bootstrap the cluster:
+
+bash
+Copy
+# On first node:
+sudo galera_new_cluster
+
+# On other nodes:
+sudo systemctl start mysql
+Verification:
+
+sql
+Copy
+mysql -e "SHOW STATUS LIKE 'wsrep%'"
+# Look for:
+# wsrep_connected: ON
+# wsrep_ready: ON
+# wsrep_cluster_size: 2
+Phase 3: AWS Cloud Integration
+3.1 Terraform Deployment
+markdown
+Copy
+**Purpose**: Provision AWS resources for cloud bursting  
+
+1. Initialize Terraform:
+```bash
+cd terraform/
+cp terraform.tfvars.example terraform.tfvars
+# Edit with your values (access keys, CIDR blocks)
+terraform init
+Key configuration (edit terraform.tfvars):
+
+hcl
+Copy
+on_prem_cidr = "192.168.1.0/24"
+haproxy_vip  = "192.168.1.200"
+instance_type = "t3.medium"
+Apply configuration:
+
+bash
+Copy
+terraform plan -out=tfplan
+terraform apply tfplan
+What Gets Created:
+
+VPC with public/private subnets
+
+Auto Scaling Group (initially 0 instances)
+
+Security groups allowing VPN and HAProxy traffic
+
+CloudWatch alarms for scaling
+
+Verification:
+
+bash
+Copy
+aws autoscaling describe-auto-scaling-groups \
+  --query "AutoScalingGroups[].Instances[].InstanceId"
+# Should return empty array initially
+3.2 WireGuard VPN Setup
+markdown
+Copy
+Purpose: Secure tunnel between on-prem and AWS  
+
+1. On on-prem servers:
+```bash
+sudo apt install wireguard
+wg genkey | sudo tee /etc/wireguard/private.key
+sudo chmod 600 /etc/wireguard/private.key
+sudo cat /etc/wireguard/private.key | wg pubkey | sudo tee /etc/wireguard/public.key
+Create /etc/wireguard/wg0.conf:
+
+plaintext
+Copy
+[Interface]
+Address = 10.8.0.1/24
+ListenPort = 51820
+PrivateKey = <ON_PREM_PRIVATE_KEY>
+
+[Peer]
+PublicKey = <AWS_INSTANCE_PUBLIC_KEY>
+AllowedIPs = 10.8.0.2/32
+PersistentKeepalive = 25
+On AWS instances (via Terraform user-data):
+
+bash
+Copy
+#!/bin/bash
+echo "[Interface]
+Address = 10.8.0.2/24
+PrivateKey = <AWS_PRIVATE_KEY>
+
+[Peer]
+PublicKey = <ON_PREM_PUBLIC_KEY>
+AllowedIPs = 192.168.1.0/24
+Endpoint = ${on_prem_public_ip}:51820
+PersistentKeepalive = 25" > /etc/wireguard/wg0.conf
+
+systemctl enable wg-quick@wg0
+Verification:
+
+bash
+Copy
+# On either side:
+sudo wg show
+# Should show handshake and transfer stats
+ping 10.8.0.1  # From AWS instance
+ping 10.8.0.2  # From on-prem
+Phase 4: Automation & Monitoring
+4.1 Dynamic HAProxy Updates
+markdown
+Copy
+Purpose: Automatically add/remove AWS instances  
+
+1. Create Ansible inventory (`ansible/inventory/aws_ec2.yml`):
+```yaml
+plugin: aws_ec2
+regions:
+  - us-east-1
+filters:
+  tag:aws:autoscaling:groupName: cloud-burst-asg
+compose:
+  ansible_host: private_ip_address
+Run playbook:
+
+bash
+Copy
+ansible-playbook -i inventory/aws_ec2.yml playbooks/haproxy.yml
+What Happens:
+
+Queries AWS API for running burst instances
+
+Generates new HAProxy config section
+
+Gracefully reloads HAProxy
+
+Verification:
+
+bash
+Copy
+echo "show servers state" | sudo socat stdio /run/haproxy/admin.sock
+# Should list AWS instances
+4.2 Monitoring Setup
+markdown
+Copy
+Purpose: Visibility into hybrid infrastructure  
+
+1. Install Prometheus exporters:
+```bash
+ansible all -i inventory/on_prem.yml -m apt -a "name=prometheus-node-exporter"
+Configure Grafana (after installation):
+
+bash
+Copy
+docker run -d -p 3000:3000 --name=grafana grafana/grafana
+Import dashboards:
+
+HAProxy: Dashboard ID 367
+
+MySQL: Dashboard ID 7362
+
+AWS EC2: Dashboard ID 6417
+
+Key Metrics to Watch:
+
+haproxy_backend_http_requests_total
+
+mysql_global_status_threads_connected
+
+aws_ec2_cpuutilization_average
+
+Phase 5: Testing & Validation
+5.1 Cloud Bursting Test
+markdown
+Copy
+Purpose: Verify auto-scaling triggers correctly  
+
+1. Generate load:
+```bash
+# On your workstation
+pip install locust
+locust -f load_testing/burst_test.py --users 500 --spawn-rate 50
+Monitor scaling:
+
+bash
+Copy
+watch -n 5 "aws autoscaling describe-auto-scaling-groups \
+  --query 'AutoScalingGroups[].Instances[].[InstanceId,HealthStatus]'"
+Expected Behavior:
+
+After 5 minutes of >70% CPU, 2 new EC2 instances launch
+
+HAProxy automatically includes them in rotation
+
+When load drops, instances terminate after cooldown
+
+5.2 Failover Testing
+markdown
+Copy
+**Purpose**: Validate high availability  
+
+1. Simulate primary failure:
+```bash
+# On primary node
+sudo systemctl stop keepalived
+Verify VIP migration:
+
+bash
+Copy
+# On secondary node
+ip addr show eth0 | grep 192.168.1.200
+Recovery Procedure:
+
+bash
+Copy
+# On original primary
+sudo systemctl start keepalived
+# VIP should return after preemption delay
+Troubleshooting Guide
+Symptom	Check	Solution
+No AWS instances scaling out	CloudWatch alarms	Verify metric filters match ASG
+Database cluster split-brain	wsrep_cluster_status	Bootstrap new cluster with --wsrep-new-cluster
+VPN connection drops	wg show	Check NAT/firewall rules for UDP 51820
+HAProxy not updating	Ansible logs	Verify IAM permissions for EC2 Describe
+bash
+Copy
+# Useful diagnostic commands:
+sudo wg show  # VPN status
+mysql -e "SHOW STATUS LIKE 'wsrep%'"  # Galera health
+sudo journalctl -u haproxy -f  # Load balancer logs
